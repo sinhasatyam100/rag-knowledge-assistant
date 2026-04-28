@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+
+  # Redis — the message broker and result backend
+  # No code needed — we use the official Redis image directly
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # FastAPI — the API server
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./logs:/app/logs
+      - ./uploads:/app/uploads
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Celery worker — the background processor
+  # Same image as the API — same code, different command
+  worker:
+    build: .
+    command: celery -A tasks worker --loglevel=info --concurrency=2
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+# Named volumes — managed by Docker, persist across restarts
+volumes:
+  redis_data:
