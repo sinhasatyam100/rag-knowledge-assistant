@@ -18,6 +18,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Downloaded once at build time, available offline at runtime
 RUN python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
 
+# After the sentence-transformers download line, add:
+RUN python3 -c "from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
+
 COPY . .
 
 RUN mkdir -p logs uploads chroma_db

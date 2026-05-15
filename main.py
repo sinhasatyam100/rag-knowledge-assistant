@@ -1,6 +1,8 @@
 # main.py
 import os
 from dotenv import load_dotenv
+
+from retriever import get_cross_encoder, retrieve_and_rerank
 load_dotenv()  # Load environment variables from .env file
 os.environ["TRANSFORMERS_OFFLINE"] = "0"
 os.environ["HF_DATASETS_OFFLINE"] = "0"
@@ -31,7 +33,11 @@ import asyncio
 from google.cloud import storage as gcs
 import shutil
 import os
-from requests import Request
+from requests import Request, request
+from retriever import get_cross_encoder
+from retriever import retrieve_and_rerank
+from cache import cache_stats
+
 
 def sync_chroma_from_gcs():
     """Download ChromaDB index from GCS using Python client."""
@@ -82,7 +88,9 @@ def sync_chroma_to_gcs(source_path="./chroma_db"):
 async def lifespan(app: FastAPI):
     logger.info("Starting RAG API...")
     sync_chroma_from_gcs()
-
+    # Pre-load cross-encoder so first request isn't slow
+    get_cross_encoder()
+    logger.info("Cross-encoder loaded")
     try:
         from langchain_chroma import Chroma
         from langchain_huggingface import HuggingFaceEmbeddings
@@ -170,6 +178,7 @@ def health_check():
         return {
             "status": "healthy",
             "documents_indexed": doc_count,
+            "cache": cache_stats(),
             "timestamp": datetime.utcnow().isoformat()
         }
     except VectorStoreNotInitializedError:
@@ -274,54 +283,75 @@ def ask_question(request: QueryRequest):
 
 @app.post("/ask/stream")
 async def ask_stream(request: QueryRequest):
-    """
-    Streaming version of /ask.
-    Returns tokens as they're generated instead of waiting for completion.
-    Uses Server-Sent Events (SSE) format.
-    
-    Unlike /ask which returns a job_id, this keeps the connection open
-    and pushes tokens directly to the client as the LLM generates them.
-    
-    Use this for: chat UI, interactive interfaces, real-time feedback.
-    Use /ask for: batch processing, async pipelines, background jobs.
-    """
     logger.info(f"Stream request: '{request.question}'")
 
-    # Get vector store
     vs = get_vectorstore(app.state)
 
-    # ── Retrieval (same as /ask) ──────────────────────────────────────
+    # ── Semantic cache check ──────────────────────────────────────────
+    # Embed the query first — needed for both cache lookup and retrieval
+    from cache import cache_lookup, cache_store
+    import asyncio, json
+
+    # Get embedding for this query
+    query_embedding = app.state.embeddings.embed_query(request.question)
+
+    # Check cache before doing any retrieval or LLM call
+    cached = cache_lookup(query_embedding)
+
+    if cached:
+        # Cache hit — stream the cached answer immediately
+        # Format exactly like a real stream so client code doesn't change
+        async def stream_cached():
+            yield f"data: {json.dumps({'type': 'cache_hit', 'similarity': 'above threshold'})}\n\n"
+            yield f"data: {json.dumps({'type': 'sources', 'sources': cached.get('sources', [])})}\n\n"
+
+            # Stream cached answer word by word for consistent UX
+            # User sees the same streaming effect even for cached responses
+            words = cached["answer"].split(" ")
+            for i, word in enumerate(words):
+                token = word if i == len(words) - 1 else word + " "
+                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+                await asyncio.sleep(0.01)  # Small delay for streaming effect
+
+            yield f"data: {json.dumps({'type': 'done', 'full_response': cached['answer'], 'from_cache': True})}\n\n"
+
+        return StreamingResponse(
+            stream_cached(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        )
+
+    # ── Cache miss — run full RAG pipeline ───────────────────────────
     try:
-        docs = vs.similarity_search(request.question, k=request.top_k)
+        docs = retrieve_and_rerank(
+            query=request.question,
+            vectorstore=vs,
+            initial_k=min(request.top_k * 5, 20),
+            final_k=request.top_k
+        )
     except Exception as e:
-        raise RetrievalError("Similarity search failed", original_error=e)
+        raise RetrievalError("Retrieval failed", original_error=e)
 
     if not docs:
         raise DocumentNotFoundError(f"No results for: '{request.question}'")
 
-    # Format context
     context = "\n\n".join([
         f"[Doc {i+1}]: {doc.page_content}"
         for i, doc in enumerate(docs)
     ])
 
     sources = [
-        {
-            "source": doc.metadata.get("source", "unknown"),
-            "preview": doc.page_content[:150]
-        }
+        {"source": doc.metadata.get("source", "unknown"),
+         "preview": doc.page_content[:150]}
         for doc in docs
     ]
 
-    # ── Async generator — the heart of streaming ──────────────────────
     async def generate():
         try:
-            import json
-            yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
-
+            import json as json_module
+            yield f"data: {json_module.dumps({'type': 'sources', 'sources': sources})}\n\n"
             await asyncio.sleep(0.01)
 
-            # ── LLM streaming call ────────────────────────────────────
             from langchain_groq import ChatGroq
             from langchain_core.prompts import ChatPromptTemplate
 
@@ -335,6 +365,7 @@ async def ask_stream(request: QueryRequest):
                 ("system", """You are a helpful assistant.
 Use ONLY the following retrieved documents to answer the question.
 If the answer is not in the documents, say you don't know.
+Always cite which Doc number you used.
 
 Retrieved documents:
 {context}"""),
@@ -349,27 +380,30 @@ Retrieved documents:
                 token = chunk.content
                 if token:
                     full_response += token
-                    # Send each token as an SSE event
-                    # type: 'token' tells the client this is answer text
-                    yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+                    yield f"data: {json_module.dumps({'type': 'token', 'content': token})}\n\n"
 
-            yield f"data: {json.dumps({'type': 'done', 'full_response': full_response, 'retrieval_count': len(docs)})}\n\n"
+            # Store in cache after successful generation
+            cache_store(
+                query=request.question,
+                query_embedding=query_embedding,
+                result={
+                    "answer": full_response,
+                    "sources": sources,
+                    "retrieval_count": len(docs)
+                }
+            )
 
-            logger.info(f"Stream completed for: '{request.question}'")
+            yield f"data: {json_module.dumps({'type': 'done', 'full_response': full_response, 'from_cache': False})}\n\n"
 
         except Exception as e:
             logger.error(f"Stream error: {e}")
-            import json
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
+                 "X-Accel-Buffering": "no"}
     )
 
 @app.get("/status/{job_id}")
