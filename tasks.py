@@ -4,6 +4,10 @@ import os
 from celery import Celery
 import time
 
+from retriever import retrieve_and_rerank
+from retriever import retrieve_and_rerank
+
+
 # ── Celery app setup ──────────────────────────────────────────────────
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -52,8 +56,18 @@ def _init_chroma():
         logger.warning(f"Worker: GCS sync failed: {e}")
 
 # Run at module import time — once per worker process
-_init_chroma()
+# At the bottom of the module-level init section, after _init_chroma()
+def _init_cross_encoder():
+    """Pre-load cross-encoder at worker startup."""
+    try:
+        from retriever import get_cross_encoder
+        get_cross_encoder()
+        logger.info("Worker: Cross-encoder pre-loaded")
+    except Exception as e:
+        logger.warning(f"Worker: Could not pre-load cross-encoder: {e}")
 
+_init_chroma()
+_init_cross_encoder()
 # ── The RAG task ──────────────────────────────────────────────────────
 
 @celery_app.task(bind=True, max_retries=3)
@@ -81,7 +95,12 @@ def process_rag_query(self, question: str, top_k: int = 4) -> dict:
         )
 
         # Retrieve
-        docs = vectorstore.similarity_search(question, k=top_k)
+        docs = retrieve_and_rerank(
+            query=question,
+            vectorstore=vectorstore,
+            initial_k=min(top_k * 5, 20),
+            final_k=top_k
+        )
 
         if not docs:
             return {
