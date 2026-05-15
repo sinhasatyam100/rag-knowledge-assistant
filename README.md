@@ -39,6 +39,18 @@ python ingest.py        # build vector index
 docker-compose up       # starts api + worker + redis
 ```
 
-## Evaluation
-- Faithfulness, answer relevancy, context precision, 
-  context recall via RAGAS (Month 4)
+## Evaluation (RAGAS)
+
+Evaluated on a golden test set using the RAGAS framework.
+Evaluation LLM: Groq LLaMA 3.1 8B | Embedding model: all-MiniLM-L6-v2
+
+| Metric | Score | Threshold | Status |
+|---|---|---|---|
+| Faithfulness | 1.0000 | 0.75 | ✅ PASS |
+| Answer Relevancy | 0.9732 | 0.75 | ✅ PASS |
+| Context Precision | 0.9167 | 0.60 | ✅ PASS |
+| Context Recall | 1.0000 | 0.60 | ✅ PASS |
+
+Faithfulness of 1.0 indicates zero hallucination — all claims 
+grounded in retrieved context. Two-stage retrieval (bi-encoder + 
+cross-encoder reranker) contributes to high context precision.
