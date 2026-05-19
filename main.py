@@ -21,6 +21,11 @@ from exceptions import (
     RetrievalError, DocumentNotFoundError, LLMError,
     IngestionError, VectorStoreNotInitializedError, RAGException
 )
+
+
+from models import QueryRequest, QueryResponse, SourceDocument, ConfluenceIngestRequest, JiraIngestRequest
+from connectors.confluence import ConfluenceConnector
+from connectors.jira import JiraConnector
 from logs import logger
 from datetime import datetime
 from pathlib import Path
@@ -555,4 +560,194 @@ async def ingest_documents(files: list[UploadFile] = File(...)):
         "total_chunks_added": total_chunks,
         "total_documents_indexed": final_count,
         "results": results
+    }
+
+@app.post("/ingest/confluence")
+async def ingest_confluence(request: ConfluenceIngestRequest):
+    """
+    Ingest pages from a Confluence space into the knowledge base.
+
+    Pass mock=true in the request body to use built-in demo data
+    without a real Confluence instance.
+
+    Example (mock mode):
+        POST /ingest/confluence
+        {
+            "base_url": "https://mock.atlassian.net",
+            "username": "demo@acme.com",
+            "api_token": "mock",
+            "space_key": "MOCK",
+            "mock": true
+        }
+    """
+    logger.info(
+        f"Confluence ingest: space='{request.space_key}' "
+        f"max_pages={request.max_pages} mock={request.mock}"
+    )
+
+    vs = get_vectorstore(app.state)
+    embeddings = getattr(app.state, "embeddings", None)
+    if embeddings is None:
+        raise VectorStoreNotInitializedError("Embeddings not loaded")
+
+    # ── Fetch documents from Confluence ──────────────────────────────
+    try:
+        if request.mock:
+            connector = ConfluenceConnector.mock()
+        else:
+            connector = ConfluenceConnector(
+                base_url=request.base_url,
+                username=request.username,
+                api_token=request.api_token,
+            )
+
+        documents = connector.fetch_space(
+            space_key=request.space_key,
+            max_pages=request.max_pages,
+        )
+
+    except Exception as e:
+        logger.error(f"Confluence fetch failed: {e}")
+        raise IngestionError(f"Failed to fetch from Confluence: {str(e)}", original_error=e)
+
+    if not documents:
+        return {
+            "message": "No pages found in the specified space",
+            "pages_fetched": 0,
+            "chunks_added": 0,
+            "total_documents_indexed": vs._collection.count(),
+        }
+
+    # ── Chunk and index ───────────────────────────────────────────────
+    try:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+        chunks = splitter.split_documents(documents)
+
+        logger.info(
+            f"Confluence: {len(documents)} pages → {len(chunks)} chunks "
+            f"(space={request.space_key})"
+        )
+
+        vs.add_documents(chunks)
+        sync_chroma_to_gcs()
+
+    except Exception as e:
+        logger.error(f"Confluence chunk/index failed: {e}")
+        raise IngestionError("Failed to index Confluence documents", original_error=e)
+
+    final_count = vs._collection.count()
+    logger.info(
+        f"Confluence ingest complete. "
+        f"pages={len(documents)} chunks={len(chunks)} total_indexed={final_count}"
+    )
+
+    return {
+        "message": "Confluence ingestion complete",
+        "space_key": request.space_key,
+        "pages_fetched": len(documents),
+        "chunks_added": len(chunks),
+        "total_documents_indexed": final_count,
+        "mock": request.mock,
+    }
+
+
+@app.post("/ingest/jira")
+async def ingest_jira(request: JiraIngestRequest):
+    """
+    Ingest issues from a JIRA project into the knowledge base.
+    Each issue (summary + description + comments) becomes one or more chunks.
+
+    Pass mock=true in the request body to use built-in demo data
+    without a real JIRA instance.
+
+    Example (mock mode):
+        POST /ingest/jira
+        {
+            "base_url": "https://mock.atlassian.net",
+            "username": "demo@acme.com",
+            "api_token": "mock",
+            "project_key": "MOCK",
+            "mock": true
+        }
+    """
+    logger.info(
+        f"JIRA ingest: project='{request.project_key}' "
+        f"max_issues={request.max_issues} mock={request.mock}"
+    )
+
+    vs = get_vectorstore(app.state)
+    embeddings = getattr(app.state, "embeddings", None)
+    if embeddings is None:
+        raise VectorStoreNotInitializedError("Embeddings not loaded")
+
+    # ── Fetch issues from JIRA ────────────────────────────────────────
+    try:
+        if request.mock:
+            connector = JiraConnector.mock()
+        else:
+            connector = JiraConnector(
+                base_url=request.base_url,
+                username=request.username,
+                api_token=request.api_token,
+            )
+
+        documents = connector.fetch_project(
+            project_key=request.project_key,
+            max_issues=request.max_issues,
+        )
+
+    except Exception as e:
+        logger.error(f"JIRA fetch failed: {e}")
+        raise IngestionError(f"Failed to fetch from JIRA: {str(e)}", original_error=e)
+
+    if not documents:
+        return {
+            "message": "No issues found in the specified project",
+            "issues_fetched": 0,
+            "chunks_added": 0,
+            "total_documents_indexed": vs._collection.count(),
+        }
+
+    # ── Chunk and index ───────────────────────────────────────────────
+    try:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+        chunks = splitter.split_documents(documents)
+
+        logger.info(
+            f"JIRA: {len(documents)} issues → {len(chunks)} chunks "
+            f"(project={request.project_key})"
+        )
+
+        vs.add_documents(chunks)
+        sync_chroma_to_gcs()
+
+    except Exception as e:
+        logger.error(f"JIRA chunk/index failed: {e}")
+        raise IngestionError("Failed to index JIRA documents", original_error=e)
+
+    final_count = vs._collection.count()
+    logger.info(
+        f"JIRA ingest complete. "
+        f"issues={len(documents)} chunks={len(chunks)} total_indexed={final_count}"
+    )
+
+    return {
+        "message": "JIRA ingestion complete",
+        "project_key": request.project_key,
+        "issues_fetched": len(documents),
+        "chunks_added": len(chunks),
+        "total_documents_indexed": final_count,
+        "mock": request.mock,
     }
