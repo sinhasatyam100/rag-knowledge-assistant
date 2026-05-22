@@ -1,0 +1,42 @@
+[
+  {
+    "question": "What is artificial intelligence?",
+    "expected_answer": "Artificial intelligence is the capability of computational systems to perform tasks typically associated with human intelligence, such as learning, reasoning, problem-solving, perception, and decision making."
+  },
+  {
+    "question": "When was the term machine learning coined and by whom?",
+    "expected_answer": "The term machine learning was coined in 1959 by Arthur Samuel, an IBM employee."
+  },
+  {
+    "question": "What is natural language processing?",
+    "expected_answer": "Natural language processing is a subfield of linguistics, computer science, and artificial intelligence concerned with the interactions between computers and human language."
+  },
+  {
+    "question": "What is the Turing test?",
+    "expected_answer": "The Turing test is a test of a machine's ability to exhibit intelligent behaviour equivalent to or indistinguishable from that of a human."
+  },
+  {
+    "question": "What is deep learning?",
+    "expected_answer": "Deep learning is a subset of machine learning that uses neural networks with many layers to learn representations of data."
+  },
+  {
+    "question": "What is AI alignment?",
+    "expected_answer": "AI alignment is the field of research focused on ensuring AI goals match human values and that AI systems behave as intended."
+  },
+  {
+    "question": "What is supervised learning?",
+    "expected_answer": "Supervised learning is a type of machine learning where the model is trained on labelled data with known input-output pairs."
+  },
+  {
+    "question": "What are neural networks?",
+    "expected_answer": "Neural networks are computing systems inspired by biological neural networks in animal brains, consisting of interconnected nodes that process information."
+  },
+  {
+    "question": "What is reinforcement learning?",
+    "expected_answer": "Reinforcement learning is a type of machine learning where an agent learns to make decisions by receiving rewards or penalties for its actions."
+  },
+  {
+    "question": "What is the difference between AI and machine learning?",
+    "expected_answer": "Artificial intelligence is the broader concept of machines performing tasks that require human intelligence, while machine learning is a subset of AI that enables machines to learn from data without being explicitly programmed."
+  }
+]

@@ -1,0 +1,41 @@
+{
+  "timestamp": "2026-05-15T11:20:02.135769",
+  "num_questions": 2,
+  "scores": {
+    "faithfulness": 1.0,
+    "answer_relevancy": 0.9732287457923675,
+    "context_precision": 0.9166666666361111,
+    "context_recall": 1.0
+  },
+  "thresholds": {
+    "faithfulness": 0.75,
+    "answer_relevancy": 0.75,
+    "context_precision": 0.6,
+    "context_recall": 0.6
+  },
+  "all_passed": true,
+  "per_question_results": [
+    {
+      "question": "What is artificial intelligence?",
+      "answer": "According to the documents, artificial intelligence (AI) is the capability of computational systems to perform tasks typically associated with human intelligence, such as learning, reasoning, problem-solving, perception, and decision-making. It is also defined as the study of agents that perceive their environment and take actions that maximize their chances of achieving defined goals.",
+      "contexts": [
+        "Artificial intelligence (AI) is the capability of computational systems to perform tasks typically associated with human intelligence, such as learning, reasoning, problem-solving, perception, and decision-making. It is a field of research in engineering, mathematics and computer science that develops and studies methods and software that enable machines to perceive their environment and use learning and intelligence to take actions that maximize their chances of achieving defined goals.[1]\nHigh-profile applications of AI include advanced web search engines, chatbots, virtual assistants, autonomous vehicles, and play and analysis in strategy games (e.g., chess and Go). Since the 2020s, generative AI has become widely available to generate images, audio, and videos from text prompts.",
+        "Russell and Norvig agree with Turing that intelligence must be defined in terms of external behavior, not internal structure.[1] However, they are critical that the test requires the machine to imitate humans. \"Aeronautical engineering texts\", they wrote, \"do not define the goal of their field as making 'machines that fly so exactly like pigeons that they can fool other pigeons.'\"[398] AI founder John McCarthy agreed, writing that \"Artificial intelligence is not, by definition, simulation of human intelligence\".[399]\nMcCarthy defines intelligence as \"the computational part of the ability to achieve goals in the world\".[400] Another AI founder, Marvin Minsky, similarly describes it as \"the ability to solve hard problems\".[401] Artificial Intelligence: A Modern Approach defines it as the study of agents that perceive their environment and take actions that maximize their chances of achieving defined goals.[1]",
+        "AI has been used in military operations in Iraq, Syria, Israel and Ukraine.[152][154][155][156]\nGenerative artificial intelligence, commonly known as generative AI or GenAI, is a subfield of artificial intelligence that uses generative models to generate text, images, videos, audio, software code (vibe coding) or other forms of data.[157] These models learn the underlying patterns and structures of their training data, and use them to generate new data[158] in response to input, which often takes the form of natural language prompts.[159][160]",
+        "No established unifying theory or paradigm has guided AI research for most of its history.[aa] The unprecedented success of statistical machine learning in the 2010s eclipsed all other approaches (so much so that some sources, especially in the business world, use the term \"artificial intelligence\" to mean \"machine learning with neural networks\"). This approach is mostly sub-symbolic, soft and narrow. Critics argue that these questions may have to be revisited by future generations of AI researchers.\nSymbolic AI (or \"GOFAI\")[410] simulated the high-level conscious reasoning that people use when they solve puzzles, express legal reasoning and do mathematics. They were highly successful at \"intelligent\" tasks such as algebra or IQ tests. In the 1960s, Newell and Simon proposed the physical symbol systems hypothesis: \"A physical symbol system has the necessary and sufficient means of general intelligent action.\"[411]"
+      ],
+      "ground_truth": "Artificial intelligence is the capability of computational systems to perform tasks typically associated with human intelligence, such as learning, reasoning, problem-solving, perception, and decision making."
+    },
+    {
+      "question": "When was the term machine learning coined and by whom?",
+      "answer": "The term \"machine learning\" was coined in 1959 by Arthur Samuel, an IBM employee and pioneer in the field of computer gaming and artificial intelligence.",
+      "contexts": [
+        "From a theoretical viewpoint, probably approximately correct learning provides a mathematical and statistical framework for describing machine learning. Most traditional machine learning and deep learning algorithms can be described as empirical risk minimisation under this framework.\nThe term machine learning was coined in 1959 by Arthur Samuel, an IBM employee and pioneer in the field of computer gaming and artificial intelligence.[5][6] The synonym self-teaching computers was also used during this time period.[7][8]",
+        "The earliest machine learning program was introduced in the 1950s when Arthur Samuel invented a computer program that calculated the winning chance in checkers for each side, but the history of machine learning roots back to decades of human desire and effort to study human cognitive processes.[9] In 1949, Canadian psychologist Donald Hebb published the book The Organization of Behavior, in which he introduced a theoretical neural structure formed by certain interactions among nerve cells.[10] Hebb's model of neurons interacting with one another set a groundwork for how AIs and machine learning algorithms work under nodes, or artificial neurons used by computers to communicate data.[9] Other researchers who have studied human cognitive systems contributed to the modern machine learning technologies as well, including logician Walter Pitts and Warren McCulloch, who proposed the early mathematical models of neural networks to come up with algorithms that mirror human thought",
+        "Machine learning (ML), reorganised and recognised as its own field, started to flourish in the 1990s. The field changed its goal from achieving artificial intelligence to tackling solvable problems of a practical nature. It shifted focus away from the symbolic approaches it had inherited from AI, and toward methods and models borrowed from statistics, fuzzy logic, and probability theory.[24]\nThere is a close connection between machine learning and compression. A system that predicts the posterior probabilities of a sequence given its entire history can be used for optimal data compression (by using arithmetic coding on the output distribution). Conversely, an optimal compressor can be used for prediction (by finding the symbol that compresses best, given the previous history). This equivalence has been used as a justification for using data compression as a benchmark for \"general intelligence\".[25][26][27]",
+        "By the early 1960s, an experimental \"learning machine\" with punched tape memory, called Cybertron, had been developed by Raytheon Company to analyse sonar signals, electrocardiograms, and speech patterns using rudimentary reinforcement learning. It was repetitively \"trained\" by a human operator/teacher to recognise patterns and equipped with a \"goof\" button to cause it to reevaluate incorrect decisions.[11] A representative book on research into machine learning during the 1960s was Nils Nilsson's book on Learning Machines, dealing mostly with machine learning for pattern classification.[12] Interest related to pattern recognition continued into the 1970s, as described by Duda and Hart in 1973.[13] In 1981, a report was given on using teaching strategies so that an artificial neural network learns to recognise 40 characters (26 letters, 10 digits, and 4 special symbols) from a computer terminal.[14]"
+      ],
+      "ground_truth": "The term machine learning was coined in 1959 by Arthur Samuel, an IBM employee."
+    }
+  ]
+}

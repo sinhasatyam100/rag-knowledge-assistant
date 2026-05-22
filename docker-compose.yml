@@ -1,0 +1,92 @@
+version: "3.9"
+
+services:
+
+  # ── Redis — message broker and cache backend ────────────────────────
+  # No custom code needed — official Redis image used directly.
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── FastAPI — the RAG API server ────────────────────────────────────
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      # 'redis' resolves to the redis service above via docker-compose DNS.
+      # PORT is read by the CMD in Dockerfile: uvicorn ... --port ${PORT:-8000}
+      - PORT=8000
+    volumes:
+      - ./chroma_db:/app/chroma_db   # Persist vector index across restarts
+      - ./logs:/app/logs
+      - ./uploads:/app/uploads
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Celery worker — background RAG task processor ───────────────────
+  # Same image as api, different entry command.
+  # Handles /ask endpoint tasks (polling pattern).
+  worker:
+    build: .
+    command: celery -A tasks worker --loglevel=info --concurrency=2
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Streamlit — chat UI (local dev only) ────────────────────────────
+  # In production this is deployed FREE on Streamlit Cloud
+  # (share.streamlit.io) pointing at the GCP Cloud Run API.
+  #
+  # Locally it runs here so you can test the full stack without
+  # deploying to Streamlit Cloud on every change.
+  #
+  # Access at: http://localhost:8501
+  streamlit:
+    build: .
+    # Override the Dockerfile CMD — run Streamlit instead of uvicorn.
+    command: >
+      streamlit run streamlit_app.py
+      --server.port=8501
+      --server.address=0.0.0.0
+      --server.headless=true
+      --browser.gatherUsageStats=false
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      # Point Streamlit at the local API service, not the GCP URL.
+      # 'api' resolves to the api service above via docker-compose DNS.
+      - API_BASE=http://api:8000
+    depends_on:
+      - api
+    restart: unless-stopped
+    # Streamlit does NOT need the chroma_db volume —
+    # it only calls the API over HTTP, never touches the DB directly.
+
+# ── Named volumes ────────────────────────────────────────────────────
+volumes:
+  redis_data:
