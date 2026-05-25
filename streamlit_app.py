@@ -307,6 +307,38 @@ with st.sidebar:
                     fetch_health(force=True)
 
     st.divider()
+
+# ── Index management ──────────────────────────────────────────────
+    st.subheader("Index Management")
+
+    if st.button("🗑 Clear knowledge base", use_container_width=True, type="secondary"):
+        if "confirm_clear" not in st.session_state:
+            st.session_state.confirm_clear = False
+        else:
+            st.session_state.confirm_clear = True
+
+    if st.session_state.get("confirm_clear"):
+        st.warning("This deletes ALL indexed documents. Are you sure?")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Yes, clear it", use_container_width=True, type="primary"):
+                with st.spinner("Clearing index…"):
+                    try:
+                        r = requests.post(f"{API_BASE}/admin/clear-index", timeout=30)
+                        r.raise_for_status()
+                        result = r.json()
+                        st.success(
+                            st.dialog(f"✓ Cleared {result.get('chunks_deleted', 0)} chunks")
+                        )
+                        st.session_state.confirm_clear = False
+                        fetch_health(force=True)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed: {e}")
+        with col2:
+            if st.button("Cancel", use_container_width=True):
+                st.session_state.confirm_clear = False
+                st.rerun()
     if st.button("🗑 Clear chat", use_container_width=True):
         st.session_state.messages = []
         st.rerun()

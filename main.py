@@ -165,6 +165,33 @@ def health_check():
             content={"status": "unhealthy", "reason": "vector store not loaded"},
         )
 
+@app.post("/admin/clear-index")
+async def clear_index():
+    """
+    Delete all documents from ChromaDB and sync the empty index to GCS.
+    Use before re-ingesting to avoid duplicate chunks.
+    """
+    vs = get_vectorstore(app.state)
+    try:
+        # Get all IDs and delete them
+        all_ids = vs._collection.get()["ids"]
+        if all_ids:
+            vs._collection.delete(ids=all_ids)
+            logger.info(f"Cleared {len(all_ids)} chunks from ChromaDB")
+        else:
+            logger.info("Index already empty")
+
+        sync_chroma_to_gcs()
+
+        return {
+            "message": "Index cleared successfully",
+            "chunks_deleted": len(all_ids),
+            "total_documents_indexed": vs._collection.count(),
+        }
+    except Exception as e:
+        logger.error(f"Clear index failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/ask")
 def ask_question(request: QueryRequest):
