@@ -32,18 +32,17 @@ import os
 # 3. Hardcoded GCP URL (fallback for quick local testing with uvicorn)
 try:
     st.set_page_config(
-    page_title="RAG Knowledge Assistant",
-    page_icon="🧠",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+        page_title="RAG Knowledge Assistant",
+        page_icon="🧠",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
     API_BASE = st.secrets["API_BASE"].rstrip("/")
 except (KeyError, FileNotFoundError):
     API_BASE = os.environ.get(
         "API_BASE",
         "https://rag-api-308467052823.asia-south1.run.app"
     ).rstrip("/")
-
 
 st.markdown("""
 <style>
@@ -216,28 +215,43 @@ with st.sidebar:
     elif source == "🔵 Confluence":
         use_mock_cf = st.toggle("Use mock data", value=True, key="cf_mock")
         with st.form("confluence_form"):
-            cf_url   = st.text_input("Base URL",
-                                     value="https://mock.atlassian.net" if use_mock_cf else "",
-                                     placeholder="https://yourorg.atlassian.net",
-                                     disabled=use_mock_cf)
-            cf_user  = st.text_input("Email",
-                                     value="demo@acme.com" if use_mock_cf else "",
-                                     disabled=use_mock_cf)
-            cf_token = st.text_input("API token",
-                                     value="mock" if use_mock_cf else "",
-                                     type="password", disabled=use_mock_cf)
+            cf_url = st.text_input(
+                "Base URL  (include context path)",
+                value="https://mock.atlassian.net" if use_mock_cf else "",
+                placeholder="https://yourorg.atlassian.net/wiki",
+                help=(
+                    "Paste the root URL of your Confluence instance including the context path.\n\n"
+                    "Self-hosted Server → https://yourorg.example.com/confluence\n"
+                    "Atlassian Cloud → https://yourorg.atlassian.net/wiki\n\n"
+                    "You can also paste a full page URL — the path will be stripped automatically."
+                ),
+                disabled=use_mock_cf,
+            )
+            cf_user = st.text_input(
+                "Email / username",
+                value="demo@acme.com" if use_mock_cf else "",
+                placeholder="you@example.com",
+                disabled=use_mock_cf,
+            )
+            cf_token = st.text_input(
+                "API token / password",
+                value="mock" if use_mock_cf else "",
+                type="password",
+                help="Confluence Server: use your login password. Atlassian Cloud: use an API token.",
+                disabled=use_mock_cf,
+            )
             cf_space = st.text_input(
-                "Space key",
+                "Space key  (or paste any page URL)",
                 value="MOCK" if use_mock_cf else "",
                 placeholder="ENG",
                 help=(
-                    "Enter the Confluence space key only, e.g.ENG.\n\n"
-                    "If you paste a full URL like https://yoursite/wiki/spaces//pages/...\n"
-                    "the connector will extract  automatically."
+                    "Enter just the space key (e.g. ENG) OR paste a full page URL.\n\n"
+                    "Example: https://yourorg.atlassian.net/wiki/spaces/ENG/pages/... "
+                    "→ extracts ENG automatically."
                 ),
             )
-            cf_max   = st.number_input("Max pages", 1, 500, 50)
-            cf_go    = st.form_submit_button("Ingest Confluence", use_container_width=True)
+            cf_max = st.number_input("Max pages", 1, 500, 50)
+            cf_go  = st.form_submit_button("Ingest Confluence", use_container_width=True)
 
         if cf_go:
             space = (cf_space.strip().upper()) or ("MOCK" if use_mock_cf else "")
@@ -255,7 +269,6 @@ with st.sidebar:
                 else:
                     st.success(f"✓ {result.get('pages_fetched',0)} pages → {result.get('chunks_added',0)} chunks")
                     fetch_health(force=True)
-
     # ── JIRA ──────────────────────────────────────────────────────────
     elif source == "🟠 JIRA":
         use_mock_j = st.toggle("Use mock data", value=True, key="j_mock")
