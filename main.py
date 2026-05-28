@@ -6,6 +6,8 @@ import json
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+import hashlib
+
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -146,6 +148,20 @@ def get_vectorstore(app_state):
     return vs
 
 
+def _make_chunk_ids(chunks: list) -> list[str]:
+    """
+    Generate a deterministic ID for each chunk based on its source + content.
+    ChromaDB will UPSERT on these IDs — re-ingesting the same page updates
+    its chunks instead of appending duplicates.
+    """
+    ids = []
+    for chunk in chunks:
+        source = chunk.metadata.get("source", "unknown")
+        # MD5 of source + content = stable ID that survives re-ingestion
+        raw    = f"{source}::{chunk.page_content[:200]}"
+        ids.append(hashlib.md5(raw.encode()).hexdigest())
+    return ids
+
 # ── Routes ────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -279,7 +295,7 @@ async def ask_stream(request: QueryRequest):
             prompt = ChatPromptTemplate.from_messages([
                 ("system", (
                     "You are a helpful assistant.\n"
-                    "Use ONLY the following retrieved documents to answer the question.\n"
+                    "dive deep into the retrieved documents to answer the question.\n"
                     "If the answer is not in the documents, say you don't know.\n"
                     "Always cite which Doc number(s) you used.\n\n"
                     "Retrieved documents:\n{context}"
@@ -396,7 +412,8 @@ async def ingest_documents(files: list[UploadFile] = File(...)):
                     doc.metadata["source"] = original_name
                 chunks    = splitter.split_documents(documents)
                 logger.info(f"{original_name}: {len(documents)} pages → {len(chunks)} chunks")
-                vs.add_documents(chunks)
+                chunk_ids = _make_chunk_ids(chunks)
+                vs.add_documents(chunks, ids=chunk_ids)
                 total_chunks += len(chunks)
                 results.append({"file": original_name, "status": "success",
                                  "chunks_added": len(chunks)})
@@ -468,10 +485,23 @@ async def ingest_confluence(request: ConfluenceIngestRequest):
             chunk_size=1000, chunk_overlap=200,
             separators=["\n\n", "\n", ". ", " ", ""],
         )
-        chunks = splitter.split_documents(documents)
+        chunks     = splitter.split_documents(documents)
+        chunk_ids  = _make_chunk_ids(chunks)
         logger.info(f"Confluence: {len(documents)} pages → {len(chunks)} chunks")
-        vs.add_documents(chunks)
+
+        # Upsert by deterministic ID — prevents duplicates on re-ingestion
+        vs.add_documents(chunks, ids=chunk_ids)
         sync_chroma_to_gcs()
+
+        # Build per-page manifest for the response
+        page_manifest = {}
+        for chunk in chunks:
+            title = chunk.metadata.get("title", chunk.metadata.get("source", "unknown"))
+            page_manifest[title] = page_manifest.get(title, 0) + 1
+        page_results = [
+            {"title": title, "chunks": count}
+            for title, count in sorted(page_manifest.items())
+        ]
     except Exception as e:
         logger.error(f"Confluence indexing failed: {e}")
         raise IngestionError("Failed to index Confluence documents", original_error=e)
@@ -479,12 +509,13 @@ async def ingest_confluence(request: ConfluenceIngestRequest):
     final_count = vs._collection.count()
     logger.info(f"Confluence ingest done. chunks={len(chunks)} total={final_count}")
     return {
-        "message":                "Confluence ingestion complete",
-        "space_key":              request.space_key,
-        "pages_fetched":          len(documents),
-        "chunks_added":           len(chunks),
+        "message":                 "Confluence ingestion complete",
+        "space_key":               request.space_key,
+        "pages_fetched":           len(documents),
+        "chunks_added":            len(chunks),
         "total_documents_indexed": final_count,
-        "mock":                   request.mock,
+        "mock":                    request.mock,
+        "pages":                   page_results,   # ← full manifest
     }
 
 
@@ -537,8 +568,18 @@ async def ingest_jira(request: JiraIngestRequest):
         )
         chunks = splitter.split_documents(documents)
         logger.info(f"JIRA: {len(documents)} issues → {len(chunks)} chunks")
-        vs.add_documents(chunks)
+        chunk_ids = _make_chunk_ids(chunks)
+        vs.add_documents(chunks, ids=chunk_ids)
         sync_chroma_to_gcs()
+
+        issue_manifest = {}
+        for chunk in chunks:
+            key = chunk.metadata.get("issue_key", chunk.metadata.get("source", "unknown"))
+            issue_manifest[key] = issue_manifest.get(key, 0) + 1
+        issue_results = [
+            {"issue_key": k, "chunks": c}
+            for k, c in sorted(issue_manifest.items())
+        ]
     except Exception as e:
         logger.error(f"JIRA indexing failed: {e}")
         raise IngestionError("Failed to index JIRA documents", original_error=e)
@@ -552,6 +593,7 @@ async def ingest_jira(request: JiraIngestRequest):
         "chunks_added":           len(chunks),
         "total_documents_indexed": final_count,
         "mock":                   request.mock,
+        "issues":                 issue_results
     }
 
 
@@ -588,4 +630,43 @@ async def trigger_reindex():
 
     except Exception as e:
         logger.error(f"Reindex failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/index/contents")
+def index_contents():
+    """
+    List every unique document currently in the index with its chunk count.
+    Lets you verify exactly what has been ingested without querying.
+    """
+    vs = get_vectorstore(app.state)
+    try:
+        data     = vs._collection.get(include=["metadatas"])
+        metas    = data.get("metadatas", [])
+        total    = len(metas)
+
+        # Group by source document
+        sources: dict = {}
+        for meta in metas:
+            source    = meta.get("source", "unknown")
+            title     = meta.get("title") or meta.get("issue_key") or source
+            connector = meta.get("connector", "file")
+            key       = source
+            if key not in sources:
+                sources[key] = {
+                    "source":    source,
+                    "title":     title,
+                    "connector": connector,
+                    "chunks":    0,
+                }
+            sources[key]["chunks"] += 1
+
+        docs_list = sorted(sources.values(), key=lambda x: x["title"])
+
+        return {
+            "total_chunks":    total,
+            "unique_documents": len(docs_list),
+            "documents":        docs_list,
+        }
+    except Exception as e:
+        logger.error(f"index_contents failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

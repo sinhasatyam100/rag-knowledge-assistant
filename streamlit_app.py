@@ -342,6 +342,39 @@ with st.sidebar:
     if st.button("🗑 Clear chat", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
+    if st.button("📋 What's in the index?", use_container_width=True):
+        with st.spinner("Fetching index contents…"):
+            try:
+                r = requests.get(f"{API_BASE}/index/contents", timeout=15)
+                r.raise_for_status()
+                data = r.json()
+                docs = data.get("documents", [])
+
+                st.caption(
+                    f"**{data['total_chunks']} chunks** across "
+                    f"**{data['unique_documents']} documents**"
+                )
+
+                if docs:
+                    # Group by connector type
+                    by_connector: dict = {}
+                    for d in docs:
+                        c = d.get("connector", "file")
+                        by_connector.setdefault(c, []).append(d)
+
+                    for connector, items in sorted(by_connector.items()):
+                        icon = {"confluence": "🔵", "jira": "🟠", "file": "📄"}.get(connector, "📄")
+                        with st.expander(f"{icon} {connector.capitalize()} ({len(items)} docs)", expanded=True):
+                            for doc in items:
+                                st.markdown(
+                                    f"**{doc['title']}** — {doc['chunks']} chunk(s)  \n"
+                                    f"<span style='font-size:11px;color:grey'>{doc['source']}</span>",
+                                    unsafe_allow_html=True,
+                                )
+                else:
+                    st.info("Index is empty. Ingest some documents first.")
+            except Exception as e:
+                st.error(f"Failed to fetch index contents: {e}")
 
 
 # ── Main chat ─────────────────────────────────────────────────────────
