@@ -1,26 +1,20 @@
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from datetime import datetime
+from typing import Optional
 
+class ChatMessage(BaseModel):
+    role:    str  # "user" or "assistant"
+    content: str
 
 class QueryRequest(BaseModel):
-    """
-    What the user sends when asking a question.
-    Pydantic validates this automatically — if the data doesn't
-    match, it raises a clear error BEFORE your code runs.
-    """
-    question: str = Field(
-        min_length=3,
-        max_length=500,
-        description="The question to ask the knowledge base"
+    question: str = Field(min_length=3, max_length=500)
+    top_k:    int = Field(default=4, ge=1, le=20)
+    history:  list[ChatMessage] = Field(
+        default=[],
+        description="Previous turns in this chat session. Last N messages passed to LLM for context.",
     )
-    top_k: int = Field(
-        default=4,
-        ge=1,
-        le=20,
-        description="Number of chunks to retrieve"
-    )
-    
+
     @field_validator("question")
     def question_must_not_be_blank(cls, v):
         if not v.strip():
