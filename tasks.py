@@ -1,21 +1,29 @@
-# tasks.py
+"""
+tasks.py — Celery task definitions.
+
+Runs in a separate worker process from the FastAPI server.
+Handles the /ask endpoint (polling pattern).
+/ask/stream bypasses Celery and runs inline in FastAPI.
+"""
 
 import os
+import logging
+
 from celery import Celery
-import time
+from dotenv import load_dotenv
 
-from retriever import retrieve_and_rerank
-from retriever import retrieve_and_rerank
+load_dotenv()
 
+logger = logging.getLogger(__name__)
 
-# ── Celery app setup ──────────────────────────────────────────────────
+# ── Celery setup ──────────────────────────────────────────────────────
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_URL  = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 celery_app = Celery(
     "rag_tasks",
     broker=REDIS_URL,
-    backend=REDIS_URL
+    backend=REDIS_URL,
 )
 
 celery_app.conf.update(
@@ -27,56 +35,54 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
 )
 
-# Module-level initialization — runs once when worker process starts
-import os
-from google.cloud import storage as gcs_client
-import logging
 
-logger = logging.getLogger(__name__)
+# ── Worker startup initialisation ────────────────────────────────────
+# These run once when the worker process starts — not on every task.
 
-def _init_chroma():
-    """Download ChromaDB from GCS once at worker startup."""
+def _init_chroma_from_gcs():
+    """Download ChromaDB index from GCS at worker startup."""
     bucket_name = os.getenv("GCS_BUCKET", "rag-knowledge-assistant-index")
-    local_path = "./chroma_db"
-    
+    local_path  = "./chroma_db"
     try:
-        client = gcs_client.Client()
+        from google.cloud import storage as gcs
+        client = gcs.Client()
         bucket = client.bucket(bucket_name)
-        blobs = list(bucket.list_blobs(prefix="chroma_db/"))
+        blobs  = list(bucket.list_blobs(prefix="chroma_db/"))
         if blobs:
             os.makedirs(local_path, exist_ok=True)
             for blob in blobs:
                 local_file = f"./{blob.name}"
                 os.makedirs(os.path.dirname(local_file), exist_ok=True)
                 blob.download_to_filename(local_file)
-            logger.info(f"Worker: Downloaded {len(blobs)} index files from GCS")
+            logger.info(f"Worker: downloaded {len(blobs)} index files from GCS")
         else:
-            logger.warning("Worker: No index found in GCS")
+            logger.warning("Worker: no index found in GCS — starting empty")
     except Exception as e:
         logger.warning(f"Worker: GCS sync failed: {e}")
 
-# Run at module import time — once per worker process
-# At the bottom of the module-level init section, after _init_chroma()
+
 def _init_cross_encoder():
-    """Pre-load cross-encoder at worker startup."""
+    """Pre-warm cross-encoder model at worker startup."""
     try:
         from retriever import get_cross_encoder
         get_cross_encoder()
-        logger.info("Worker: Cross-encoder pre-loaded")
+        logger.info("Worker: cross-encoder pre-loaded")
     except Exception as e:
-        logger.warning(f"Worker: Could not pre-load cross-encoder: {e}")
+        logger.warning(f"Worker: could not pre-load cross-encoder: {e}")
 
-_init_chroma()
+
+_init_chroma_from_gcs()
 _init_cross_encoder()
-# ── The RAG task ──────────────────────────────────────────────────────
+
+
+# ── RAG task ─────────────────────────────────────────────────────────
 
 @celery_app.task(bind=True, max_retries=3)
 def process_rag_query(self, question: str, top_k: int = 4) -> dict:
     """
-    This function runs in a WORKER PROCESS, not in your API.
-    It receives the question, does the retrieval + LLM call,
-    and returns the result. Celery stores the result in Redis
-    automatically because we set a backend above.
+    Runs the full RAG pipeline in a worker process.
+    Called by /ask endpoint via .delay(). Result stored in Redis.
+    Retries up to 3 times with exponential backoff on failure.
     """
     try:
         from langchain_chroma import Chroma
@@ -84,80 +90,72 @@ def process_rag_query(self, question: str, top_k: int = 4) -> dict:
         from langchain_groq import ChatGroq
         from langchain_core.prompts import ChatPromptTemplate
         from langchain_core.output_parsers import StrOutputParser
+        from retriever import retrieve_and_rerank
 
-        # Load vector store
-        embeddings = HuggingFaceEmbeddings(
+        embeddings  = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
         vectorstore = Chroma(
             persist_directory="./chroma_db",
-            embedding_function=embeddings
+            embedding_function=embeddings,
         )
 
-        # Retrieve
         docs = retrieve_and_rerank(
             query=question,
             vectorstore=vectorstore,
             initial_k=min(top_k * 5, 20),
-            final_k=top_k
+            final_k=top_k,
         )
 
         if not docs:
             return {
-                "status": "completed",
-                "answer": "No relevant documents found.",
-                "sources": [],
-                "question": question,
-                "retrieval_count": 0
+                "status":          "completed",
+                "answer":          "No relevant documents found for your question.",
+                "sources":         [],
+                "question":        question,
+                "retrieval_count": 0,
             }
 
-        # Format context
         context = "\n\n".join([
-            f"[Doc {i+1}]: {doc.page_content}"
-            for i, doc in enumerate(docs)
+            f"[Doc {i+1}]: {doc.page_content}" for i, doc in enumerate(docs)
         ])
-
         sources = [
             {
-                "content": doc.page_content[:200],
-                "source": doc.metadata.get("source", "unknown"),
-                "chunk_index": i
+                "content":     doc.page_content[:200],
+                "source":      doc.metadata.get("source", "unknown"),
+                "chunk_index": i,
             }
             for i, doc in enumerate(docs)
         ]
 
-        # LLM call
         llm = ChatGroq(
             model="llama-3.1-8b-instant",
-            api_key=os.getenv("groq_api_key")
+            api_key=os.getenv("groq_api_key"),
         )
-
         prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a helpful assistant.
-Use ONLY the following retrieved documents to answer the question.
-If the answer is not in the documents, say you don't know.
-
-Retrieved documents:
-{context}"""),
-            ("human", "{question}")
+            ("system", (
+                "You are a helpful assistant.\n"
+                "Use ONLY the following retrieved documents to answer the question.\n"
+                "If the answer is not in the documents, say you don't know.\n"
+                "Always cite which Doc number(s) you used.\n\n"
+                "Retrieved documents:\n{context}"
+            )),
+            ("human", "{question}"),
         ])
 
-        chain = prompt | llm | StrOutputParser()
-        answer = chain.invoke({
-            "context": context,
-            "question": question
+        answer = (prompt | llm | StrOutputParser()).invoke({
+            "context":  context,
+            "question": question,
         })
 
         return {
-            "status": "completed",
-            "answer": answer,
-            "sources": sources,
-            "question": question,
-            "retrieval_count": len(docs)
+            "status":          "completed",
+            "answer":          answer,
+            "sources":         sources,
+            "question":        question,
+            "retrieval_count": len(docs),
         }
 
     except Exception as exc:
-        raise self.retry(
-            exc=exc,
-            countdown=2 ** self.request.retries
-        )
+        # Exponential backoff: 2s, 4s, 8s
+        raise self.retry(exc=exc, countdown=2 ** self.request.retries)

@@ -1,360 +1,287 @@
-# main.py
 import os
-from dotenv import load_dotenv
-
-from retriever import get_cross_encoder, retrieve_and_rerank
-load_dotenv()  # Load environment variables from .env file
-os.environ["TRANSFORMERS_OFFLINE"] = "0"
-os.environ["HF_DATASETS_OFFLINE"] = "0"
-os.environ["HF_HUB_OFFLINE"] = "0"
-os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN")
-# os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT")
-# os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
-# os.environ["LANGCHAIN_TRACING_V2"] = "true"
-groq_api_key = os.getenv("groq_api_key")
-
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import JSONResponse
+import uuid
+import shutil
+import asyncio
+import json
 from contextlib import asynccontextmanager
-from models import QueryRequest, QueryResponse, SourceDocument
-from exceptions import (
-    RetrievalError, DocumentNotFoundError, LLMError,
-    IngestionError, VectorStoreNotInitializedError, RAGException
-)
-
-
-from models import QueryRequest, QueryResponse, SourceDocument, ConfluenceIngestRequest, JiraIngestRequest
-from connectors.confluence import ConfluenceConnector
-from connectors.jira import JiraConnector
-from logs import logger
 from datetime import datetime
 from pathlib import Path
-import time
-import shutil
-import uuid
-from tasks import celery_app, process_rag_query
-from fastapi.responses import StreamingResponse
-import asyncio
-from google.cloud import storage as gcs
-import shutil
-import os
-from requests import Request, request
-from retriever import get_cross_encoder
-from retriever import retrieve_and_rerank
-from cache import cache_stats
+import hashlib
 
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from google.cloud import storage as gcs
+
+from logs import logger
+from exceptions import (
+    RetrievalError, DocumentNotFoundError, LLMError,
+    IngestionError, VectorStoreNotInitializedError,
+)
+from models import (
+    QueryRequest,
+    ConfluenceIngestRequest,
+    JiraIngestRequest,
+)
+from retriever import get_cross_encoder, retrieve_and_rerank
+from cache import cache_lookup, cache_store, cache_stats
+from tasks import celery_app, process_rag_query
+
+
+# ── GCS helpers ───────────────────────────────────────────────────────
 
 def sync_chroma_from_gcs():
-    """Download ChromaDB index from GCS using Python client."""
+    """Download ChromaDB index from GCS at startup."""
     bucket_name = os.getenv("GCS_BUCKET", "rag-knowledge-assistant-index")
-    local_path = "./chroma_db"
-    
-    logger.info(f"Downloading ChromaDB index from gs://{bucket_name}/chroma_db/...")
+    local_path  = "./chroma_db"
+    logger.info(f"Downloading ChromaDB index from gs://{bucket_name}/chroma_db/ ...")
     try:
         client = gcs.Client()
         bucket = client.bucket(bucket_name)
-        blobs = list(bucket.list_blobs(prefix="chroma_db/"))
-        
+        blobs  = list(bucket.list_blobs(prefix="chroma_db/"))
         if not blobs:
             logger.warning("No index found in GCS. Starting with empty index.")
             return
-            
         os.makedirs(local_path, exist_ok=True)
-        
         for blob in blobs:
-            # blob.name = "chroma_db/chroma.sqlite3" etc
             local_file = f"./{blob.name}"
             os.makedirs(os.path.dirname(local_file), exist_ok=True)
             blob.download_to_filename(local_file)
-        
-        logger.info(f"Downloaded {len(blobs)} files from GCS")
-        
+        logger.info(f"Downloaded {len(blobs)} files from GCS.")
     except Exception as e:
         logger.warning(f"Could not download index from GCS: {e}. Starting with empty index.")
 
-def sync_chroma_to_gcs(source_path="./chroma_db"):
+
+def sync_chroma_to_gcs(source_path: str = "./chroma_db"):
+    """Upload ChromaDB index to GCS after ingestion."""
     bucket_name = os.getenv("GCS_BUCKET", "rag-knowledge-assistant-index")
-    logger.info(f"Uploading {source_path} to GCS...")
+    logger.info(f"Uploading {source_path} to GCS ...")
     try:
         client = gcs.Client()
         bucket = client.bucket(bucket_name)
         for root, dirs, files in os.walk(source_path):
             for file in files:
                 local_file = os.path.join(root, file)
-                gcs_path = "chroma_db/" + os.path.relpath(local_file, source_path).replace("\\", "/")
-                blob = bucket.blob(gcs_path)
-                blob.upload_from_filename(local_file)
-        logger.info("ChromaDB index uploaded to GCS successfully")
+                gcs_path   = "chroma_db/" + os.path.relpath(local_file, source_path).replace("\\", "/")
+                bucket.blob(gcs_path).upload_from_filename(local_file)
+        logger.info("ChromaDB index uploaded to GCS.")
     except Exception as e:
         logger.error(f"Could not upload index to GCS: {e}")
-        
-        # ── Lifespan ─────────────────────────────────────────────────────────
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting RAG API...")
+    logger.info("Starting RAG API ...")
     sync_chroma_from_gcs()
-    # Pre-load cross-encoder so first request isn't slow
     get_cross_encoder()
-    logger.info("Cross-encoder loaded")
+    logger.info("Cross-encoder pre-warmed.")
     try:
         from langchain_chroma import Chroma
         from langchain_huggingface import HuggingFaceEmbeddings
-        print("Loading vector store and embeddings...")
-        embeddings = HuggingFaceEmbeddings(
+
+        embeddings  = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
-        print("Initializing Chroma vector store...")
         vectorstore = Chroma(
             persist_directory="./chroma_db",
-            embedding_function=embeddings
+            embedding_function=embeddings,
         )
         doc_count = vectorstore._collection.count()
-        print(f"Vector store loaded with {doc_count} documents")
-        # Store BOTH on app.state — we need embeddings in /ingest too
         app.state.vectorstore = vectorstore
-        app.state.embeddings = embeddings
-
-        logger.info(f"Vector store loaded. Documents indexed: {doc_count}")
-
+        app.state.embeddings  = embeddings
+        logger.info(f"Vector store ready. Documents indexed: {doc_count}")
     except Exception as e:
-        # CRITICAL because the app is useless without the vector store
-        logger.critical(f"Failed to load vector store on startup: {e}")
-        raise  # Re-raise — don't silently start a broken server
+        logger.critical(f"Failed to load vector store: {e}")
+        raise
 
     yield
 
-    logger.info("Shutting down RAG API...")
+    logger.info("Shutting down RAG API ...")
 
 
 app = FastAPI(
     title="RAG Knowledge Assistant",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 
-# ── Exception handlers ───────────────────────────────────────────────
+# ── Exception handlers ────────────────────────────────────────────────
 
 @app.exception_handler(DocumentNotFoundError)
-async def document_not_found_handler(request, exc: DocumentNotFoundError):
+async def document_not_found_handler(request: Request, exc: DocumentNotFoundError):
     logger.warning(f"No documents found: {exc.message}")
     return JSONResponse(status_code=404, content={"error": exc.message})
 
 @app.exception_handler(RetrievalError)
-async def retrieval_error_handler(request, exc: RetrievalError):
+async def retrieval_error_handler(request: Request, exc: RetrievalError):
     logger.error(f"Retrieval error: {exc}")
     return JSONResponse(status_code=500, content={"error": exc.message})
 
 @app.exception_handler(LLMError)
-async def llm_error_handler(request, exc: LLMError):
+async def llm_error_handler(request: Request, exc: LLMError):
     logger.error(f"LLM error: {exc}")
     return JSONResponse(status_code=500, content={"error": exc.message})
 
 @app.exception_handler(IngestionError)
-async def ingestion_error_handler(request, exc: IngestionError):
+async def ingestion_error_handler(request: Request, exc: IngestionError):
     logger.error(f"Ingestion error: {exc}")
     return JSONResponse(status_code=500, content={"error": exc.message})
 
 @app.exception_handler(VectorStoreNotInitializedError)
-async def vector_store_not_initialized_handler(request, exc):
+async def vs_not_initialized_handler(request: Request, exc: VectorStoreNotInitializedError):
     logger.critical(f"Vector store not initialized: {exc}")
     return JSONResponse(status_code=503, content={"error": "Service unavailable, try again shortly"})
 
 
 # ── Helper ────────────────────────────────────────────────────────────
+
 def get_vectorstore(app_state):
-    """
-    Safely retrieves vectorstore from app.state.
-    Raises VectorStoreNotInitializedError if missing.
-    Called at the start of any route that needs the vector store.
-    """
     vs = getattr(app_state, "vectorstore", None)
     if vs is None:
         raise VectorStoreNotInitializedError("Vector store not loaded")
     return vs
 
 
+def _make_chunk_ids(chunks: list) -> list[str]:
+    """
+    Generate a deterministic ID for each chunk based on its source + content.
+    ChromaDB will UPSERT on these IDs — re-ingesting the same page updates
+    its chunks instead of appending duplicates.
+    """
+    ids = []
+    for chunk in chunks:
+        source = chunk.metadata.get("source", "unknown")
+        # MD5 of source + content = stable ID that survives re-ingestion
+        raw    = f"{source}::{chunk.page_content[:200]}"
+        ids.append(hashlib.md5(raw.encode()).hexdigest())
+    return ids
+
 # ── Routes ────────────────────────────────────────────────────────────
+
 @app.get("/health")
 def health_check():
     try:
-        vs = get_vectorstore(app.state)
+        vs        = get_vectorstore(app.state)
         doc_count = vs._collection.count()
         return {
-            "status": "healthy",
-            "documents_indexed": doc_count,
-            "cache": cache_stats(),
-            "timestamp": datetime.utcnow().isoformat()
+            "status":             "healthy",
+            "documents_indexed":  doc_count,
+            "cache":              cache_stats(),
+            "timestamp":          datetime.utcnow().isoformat(),
         }
     except VectorStoreNotInitializedError:
         return JSONResponse(
             status_code=503,
-            content={"status": "unhealthy", "reason": "vector store not loaded"}
+            content={"status": "unhealthy", "reason": "vector store not loaded"},
         )
 
-@app.post("/admin/reindex")
-async def trigger_reindex():
+@app.post("/admin/clear-index")
+async def clear_index():
     """
-    Triggered by Cloud Scheduler nightly.
-    Re-runs ingestion from all source URLs and uploads to GCS.
-    Protected — only callable from Cloud Scheduler via OIDC token.
+    Delete all documents from ChromaDB and sync the empty index to GCS.
+    Use before re-ingesting to avoid duplicate chunks.
     """
-    logger.info("Reindex triggered")
-    
+    vs = get_vectorstore(app.state)
     try:
-        from langchain_community.document_loaders import WebBaseLoader
-        from langchain.text_splitter import RecursiveCharacterTextSplitter
-        import bs4, shutil
+        # Get all IDs and delete them
+        all_ids = vs._collection.get()["ids"]
+        if all_ids:
+            vs._collection.delete(ids=all_ids)
+            logger.info(f"Cleared {len(all_ids)} chunks from ChromaDB")
+        else:
+            logger.info("Index already empty")
 
-        URLS = [
-            "https://en.wikipedia.org/wiki/Artificial_intelligence",
-            "https://en.wikipedia.org/wiki/Machine_learning",
-            "https://en.wikipedia.org/wiki/Natural_language_processing",
-        ]
-
-        # Load
-        loader = WebBaseLoader(
-            web_paths=URLS,
-            bs_kwargs=dict(parse_only=bs4.SoupStrainer("p"))
-        )
-        documents = loader.load()
-
-        # Chunk
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000, chunk_overlap=200,
-            separators=["\n\n", "\n", ". ", " ", ""]
-        )
-        chunks = splitter.split_documents(documents)
-        logger.info(f"Reindex: {len(chunks)} chunks from {len(URLS)} URLs")
-
-        # Rebuild index
-        shutil.rmtree("/tmp/chroma_db", ignore_errors=True)
-
-        from langchain_chroma import Chroma
-        from langchain_huggingface import HuggingFaceEmbeddings
-
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
-        
-        
-        vectorstore = Chroma.from_documents(
-            chunks, embeddings,
-            persist_directory="/tmp/chroma_db"  # /tmp is always writable
-        )
-        # Upload to GCS
-        sync_chroma_to_gcs(source_path="/tmp/chroma_db")
-
-        # And update app.state to point to new location
-        # Update app.state so running instance uses new index
-        app.state.vectorstore = vectorstore
-        count = vectorstore._collection.count()
-        logger.info(f"Reindex complete. {count} chunks indexed.")
+        sync_chroma_to_gcs()
 
         return {
-            "status": "success",
-            "chunks_indexed": count,
-            "sources": len(URLS)
+            "message": "Index cleared successfully",
+            "chunks_deleted": len(all_ids),
+            "total_documents_indexed": vs._collection.count(),
         }
-
     except Exception as e:
-        logger.error(f"Reindex failed: {e}")
+        logger.error(f"Clear index failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/ask")
 def ask_question(request: QueryRequest):
     """
-    Now returns immediately with a job_id.
-    The actual RAG processing happens in a background worker.
+    Non-blocking query endpoint. Returns a job_id immediately.
+    Poll /status/{job_id} for the result.
     """
     logger.info(f"Query received: '{request.question}' top_k={request.top_k}")
-
-    # .delay() puts the task on the Redis queue and returns immediately
-    # It does NOT wait for the task to complete
-    task = process_rag_query.delay(
-        request.question,
-        request.top_k
-    )
-
+    task = process_rag_query.delay(request.question, request.top_k)
     logger.info(f"Task queued: {task.id}")
-
-    # Return immediately — milliseconds, not seconds
     return {
-        "job_id": task.id,
-        "status": "queued",
-        "message": "Query is being processed",
-        "status_url": f"/status/{task.id}"
+        "job_id":     task.id,
+        "status":     "queued",
+        "message":    "Query is being processed",
+        "status_url": f"/status/{task.id}",
     }
+
 
 @app.post("/ask/stream")
 async def ask_stream(request: QueryRequest):
+    """
+    Streaming query endpoint. Returns SSE tokens in real time.
+    Used by the Streamlit UI.
+    """
     logger.info(f"Stream request: '{request.question}'")
-
     vs = get_vectorstore(app.state)
 
-    # ── Semantic cache check ──────────────────────────────────────────
-    # Embed the query first — needed for both cache lookup and retrieval
-    from cache import cache_lookup, cache_store
-    import asyncio, json
-
-    # Get embedding for this query
+    # Embed query — used for both cache lookup and retrieval
     query_embedding = app.state.embeddings.embed_query(request.question)
 
-    # Check cache before doing any retrieval or LLM call
+    # Check semantic cache first
     cached = cache_lookup(query_embedding)
-
     if cached:
-        # Cache hit — stream the cached answer immediately
-        # Format exactly like a real stream so client code doesn't change
         async def stream_cached():
-            yield f"data: {json.dumps({'type': 'cache_hit', 'similarity': 'above threshold'})}\n\n"
+            yield f"data: {json.dumps({'type': 'cache_hit'})}\n\n"
             yield f"data: {json.dumps({'type': 'sources', 'sources': cached.get('sources', [])})}\n\n"
-
-            # Stream cached answer word by word for consistent UX
-            # User sees the same streaming effect even for cached responses
             words = cached["answer"].split(" ")
             for i, word in enumerate(words):
                 token = word if i == len(words) - 1 else word + " "
                 yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
-                await asyncio.sleep(0.01)  # Small delay for streaming effect
-
+                await asyncio.sleep(0.01)
             yield f"data: {json.dumps({'type': 'done', 'full_response': cached['answer'], 'from_cache': True})}\n\n"
 
         return StreamingResponse(
             stream_cached(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
-    # ── Cache miss — run full RAG pipeline ───────────────────────────
+    # Cache miss — run full RAG pipeline
     try:
         docs = retrieve_and_rerank(
             query=request.question,
             vectorstore=vs,
             initial_k=min(request.top_k * 5, 20),
-            final_k=request.top_k
+            final_k=request.top_k,
         )
     except Exception as e:
         raise RetrievalError("Retrieval failed", original_error=e)
 
     if not docs:
-        raise DocumentNotFoundError(f"No results for: '{request.question}'")
+        raise DocumentNotFoundError(f"No results found for: '{request.question}'")
 
     context = "\n\n".join([
-        f"[Doc {i+1}]: {doc.page_content}"
-        for i, doc in enumerate(docs)
+        f"[Doc {i+1}]: {doc.page_content}" for i, doc in enumerate(docs)
     ])
-
     sources = [
-        {"source": doc.metadata.get("source", "unknown"),
-         "preview": doc.page_content[:150]}
+        {"source": doc.metadata.get("source", "unknown"), "preview": doc.page_content[:150]}
         for doc in docs
     ]
 
     async def generate():
         try:
-            import json as json_module
-            yield f"data: {json_module.dumps({'type': 'sources', 'sources': sources})}\n\n"
+            yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
             await asyncio.sleep(0.01)
 
             from langchain_groq import ChatGroq
@@ -363,106 +290,78 @@ async def ask_stream(request: QueryRequest):
             llm = ChatGroq(
                 model="llama-3.1-8b-instant",
                 api_key=os.getenv("groq_api_key"),
-                streaming=True
+                streaming=True,
             )
-
             prompt = ChatPromptTemplate.from_messages([
-                ("system", """You are a helpful assistant.
-Use ONLY the following retrieved documents to answer the question.
-If the answer is not in the documents, say you don't know.
-Always cite which Doc number you used.
-
-Retrieved documents:
-{context}"""),
-                ("human", "{question}")
+                ("system", (
+                    "You are a helpful assistant.\n"
+                    "dive deep into the retrieved documents to answer the question.\n"
+                    "If the answer is not in the documents, say you don't know.\n"
+                    "Always cite which Doc number(s) you used.\n\n"
+                    "Retrieved documents:\n{context}"
+                )),
+                ("human", "{question}"),
             ])
 
             full_response = ""
-            async for chunk in (prompt | llm).astream({
-                "context": context,
-                "question": request.question
-            }):
+            async for chunk in (prompt | llm).astream(
+                {"context": context, "question": request.question}
+            ):
                 token = chunk.content
                 if token:
                     full_response += token
-                    yield f"data: {json_module.dumps({'type': 'token', 'content': token})}\n\n"
+                    yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
-            # Store in cache after successful generation
             cache_store(
                 query=request.question,
                 query_embedding=query_embedding,
-                result={
-                    "answer": full_response,
-                    "sources": sources,
-                    "retrieval_count": len(docs)
-                }
+                result={"answer": full_response, "sources": sources, "retrieval_count": len(docs)},
             )
-
-            yield f"data: {json_module.dumps({'type': 'done', 'full_response': full_response, 'from_cache': False})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'full_response': full_response, 'from_cache': False})}\n\n"
 
         except Exception as e:
-            logger.error(f"Stream error: {e}")
+            logger.error(f"Stream generation error: {e}")
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
-                 "X-Accel-Buffering": "no"}
+        headers={
+            "Cache-Control":    "no-cache",
+            "Connection":       "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
+
 
 @app.get("/status/{job_id}")
 def get_job_status(job_id: str):
-    """
-    Poll this endpoint to check if your job is done.
-    
-    Celery task states:
-    PENDING  → task is queued, worker hasn't picked it up yet
-    STARTED  → worker picked it up, currently processing
-    SUCCESS  → done, result is available
-    FAILURE  → something went wrong after all retries
-    RETRY    → failed once, waiting to retry
-    """
+    """Poll for the result of an /ask job."""
     from celery.result import AsyncResult
-
     task_result = AsyncResult(job_id, app=celery_app)
 
-    if task_result.state == "PENDING":
-        return {"job_id": job_id, "status": "queued"}
-
-    elif task_result.state == "STARTED":
-        return {"job_id": job_id, "status": "processing"}
-
-    elif task_result.state == "SUCCESS":
-        return {
-            "job_id": job_id,
-            "status": "completed",
-            "result": task_result.result
-        }
-
-    elif task_result.state == "FAILURE":
-        return {
-            "job_id": job_id,
-            "status": "failed",
-            "error": str(task_result.result)
-        }
-
-    elif task_result.state == "RETRY":
-        return {"job_id": job_id, "status": "retrying"}
-
+    state_map = {
+        "PENDING": "queued",
+        "STARTED": "processing",
+        "RETRY":   "retrying",
+    }
+    if task_result.state in state_map:
+        return {"job_id": job_id, "status": state_map[task_result.state]}
+    if task_result.state == "SUCCESS":
+        return {"job_id": job_id, "status": "completed", "result": task_result.result}
+    if task_result.state == "FAILURE":
+        return {"job_id": job_id, "status": "failed", "error": str(task_result.result)}
     return {"job_id": job_id, "status": task_result.state.lower()}
+
 
 @app.post("/ingest")
 async def ingest_documents(files: list[UploadFile] = File(...)):
     """
-    Upload one or more documents to be added to the knowledge base.
-    Supports .txt and .pdf files.
-    The server keeps running — existing documents are preserved.
-    New chunks are immediately searchable after this returns.
+    Upload .txt or .pdf files into the knowledge base.
+    Existing documents are preserved. GCS is updated once at the end.
     """
-    logger.info(f"Ingest request received: {len(files)} file(s)")
-
-    vs = get_vectorstore(app.state)
+    logger.info(f"Ingest request: {len(files)} file(s)")
+    vs         = get_vectorstore(app.state)
     embeddings = getattr(app.state, "embeddings", None)
     if embeddings is None:
         raise VectorStoreNotInitializedError("Embeddings not loaded")
@@ -471,189 +370,152 @@ async def ingest_documents(files: list[UploadFile] = File(...)):
     upload_dir.mkdir(exist_ok=True)
 
     saved_paths = []
-    results = []
+    results     = []
 
-    # ── Save uploaded files to disk ───────────────────────────────────
+    # Save files to disk
     for file in files:
         if not file.filename.endswith((".txt", ".pdf")):
-            results.append({
-                "file": file.filename,
-                "status": "rejected",
-                "reason": "Only .txt and .pdf files are supported"
-            })
-            logger.warning(f"Rejected file: {file.filename} — unsupported type")
+            results.append({"file": file.filename, "status": "rejected",
+                             "reason": "Only .txt and .pdf files are supported"})
+            logger.warning(f"Rejected: {file.filename} — unsupported type")
             continue
-
-        safe_filename = f"{uuid.uuid4()}_{file.filename}"
-        file_path = upload_dir / safe_filename
-
+        safe_name = f"{uuid.uuid4()}_{file.filename}"
+        file_path = upload_dir / safe_name
         try:
             with open(file_path, "wb") as f:
                 shutil.copyfileobj(file.file, f)
             saved_paths.append((file.filename, file_path))
             logger.info(f"Saved: {file.filename} → {file_path}")
         except Exception as e:
-            raise IngestionError(
-                f"Failed to save file: {file.filename}",
-                original_error=e
-            )
+            raise IngestionError(f"Failed to save {file.filename}", original_error=e)
 
     if not saved_paths:
         raise IngestionError("No valid files to process")
 
-    # ── Load, chunk, embed, add to ChromaDB ───────────────────────────
+    # Process all files, then sync GCS once
     try:
         from langchain_community.document_loaders import TextLoader, PyPDFLoader
         from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            separators=["\n\n", "\n", ". ", " ", ""]
+        splitter    = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=200,
+            separators=["\n\n", "\n", ". ", " ", ""],
         )
-
         total_chunks = 0
 
         for original_name, file_path in saved_paths:
             try:
-                # Choose loader based on file type
-                if str(file_path).endswith(".pdf"):
-                    loader = PyPDFLoader(str(file_path))
-                else:
-                    loader = TextLoader(str(file_path), encoding="utf-8")
-
+                loader    = PyPDFLoader(str(file_path)) if str(file_path).endswith(".pdf") \
+                            else TextLoader(str(file_path), encoding="utf-8")
                 documents = loader.load()
-
                 for doc in documents:
                     doc.metadata["source"] = original_name
-
-                chunks = splitter.split_documents(documents)
+                chunks    = splitter.split_documents(documents)
                 logger.info(f"{original_name}: {len(documents)} pages → {len(chunks)} chunks")
-
-                vs.add_documents(chunks)
-                sync_chroma_to_gcs()
+                chunk_ids = _make_chunk_ids(chunks)
+                vs.add_documents(chunks, ids=chunk_ids)
                 total_chunks += len(chunks)
-
-                results.append({
-                    "file": original_name,
-                    "status": "success",
-                    "chunks_added": len(chunks)
-                })
-
+                results.append({"file": original_name, "status": "success",
+                                 "chunks_added": len(chunks)})
             except Exception as e:
                 logger.error(f"Failed to process {original_name}: {e}")
-                results.append({
-                    "file": original_name,
-                    "status": "failed",
-                    "reason": str(e)
-                })
+                results.append({"file": original_name, "status": "failed", "reason": str(e)})
+
+        # Single GCS sync after all files are processed
+        sync_chroma_to_gcs()
 
     except Exception as e:
         raise IngestionError("Document processing failed", original_error=e)
 
     final_count = vs._collection.count()
     logger.info(f"Ingest complete. Added {total_chunks} chunks. Total indexed: {final_count}")
-
     return {
-        "message": f"Ingestion complete",
-        "files_processed": len(saved_paths),
-        "total_chunks_added": total_chunks,
+        "message":                "Ingestion complete",
+        "files_processed":        len(saved_paths),
+        "total_chunks_added":     total_chunks,
         "total_documents_indexed": final_count,
-        "results": results
+        "results":                results,
     }
+
 
 @app.post("/ingest/confluence")
 async def ingest_confluence(request: ConfluenceIngestRequest):
     """
     Ingest pages from a Confluence space into the knowledge base.
-
-    Pass mock=true in the request body to use built-in demo data
-    without a real Confluence instance.
-
-    Example (mock mode):
-        POST /ingest/confluence
-        {
-            "base_url": "https://mock.atlassian.net",
-            "username": "demo@acme.com",
-            "api_token": "mock",
-            "space_key": "MOCK",
-            "mock": true
-        }
+    Use mock=true for a built-in demo without a real Confluence instance.
     """
     logger.info(
         f"Confluence ingest: space='{request.space_key}' "
         f"max_pages={request.max_pages} mock={request.mock}"
     )
-
-    vs = get_vectorstore(app.state)
+    vs         = get_vectorstore(app.state)
     embeddings = getattr(app.state, "embeddings", None)
     if embeddings is None:
         raise VectorStoreNotInitializedError("Embeddings not loaded")
 
-    # ── Fetch documents from Confluence ──────────────────────────────
     try:
-        if request.mock:
-            connector = ConfluenceConnector.mock()
-        else:
-            connector = ConfluenceConnector(
+        from connectors.confluence import ConfluenceConnector
+        connector = (
+            ConfluenceConnector.mock() if request.mock
+            else ConfluenceConnector(
                 base_url=request.base_url,
                 username=request.username,
                 api_token=request.api_token,
             )
-
+        )
         documents = connector.fetch_space(
             space_key=request.space_key,
             max_pages=request.max_pages,
         )
-
     except Exception as e:
         logger.error(f"Confluence fetch failed: {e}")
-        raise IngestionError(f"Failed to fetch from Confluence: {str(e)}", original_error=e)
+        raise IngestionError(f"Failed to fetch from Confluence: {e}", original_error=e)
 
     if not documents:
         return {
-            "message": "No pages found in the specified space",
-            "pages_fetched": 0,
-            "chunks_added": 0,
+            "message":                "No pages found in this space",
+            "pages_fetched":          0,
+            "chunks_added":           0,
             "total_documents_indexed": vs._collection.count(),
         }
 
-    # ── Chunk and index ───────────────────────────────────────────────
     try:
         from langchain_text_splitters import RecursiveCharacterTextSplitter
-
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            separators=["\n\n", "\n", ". ", " ", ""]
+            chunk_size=1000, chunk_overlap=200,
+            separators=["\n\n", "\n", ". ", " ", ""],
         )
-        chunks = splitter.split_documents(documents)
+        chunks     = splitter.split_documents(documents)
+        chunk_ids  = _make_chunk_ids(chunks)
+        logger.info(f"Confluence: {len(documents)} pages → {len(chunks)} chunks")
 
-        logger.info(
-            f"Confluence: {len(documents)} pages → {len(chunks)} chunks "
-            f"(space={request.space_key})"
-        )
-
-        vs.add_documents(chunks)
+        # Upsert by deterministic ID — prevents duplicates on re-ingestion
+        vs.add_documents(chunks, ids=chunk_ids)
         sync_chroma_to_gcs()
 
+        # Build per-page manifest for the response
+        page_manifest = {}
+        for chunk in chunks:
+            title = chunk.metadata.get("title", chunk.metadata.get("source", "unknown"))
+            page_manifest[title] = page_manifest.get(title, 0) + 1
+        page_results = [
+            {"title": title, "chunks": count}
+            for title, count in sorted(page_manifest.items())
+        ]
     except Exception as e:
-        logger.error(f"Confluence chunk/index failed: {e}")
+        logger.error(f"Confluence indexing failed: {e}")
         raise IngestionError("Failed to index Confluence documents", original_error=e)
 
     final_count = vs._collection.count()
-    logger.info(
-        f"Confluence ingest complete. "
-        f"pages={len(documents)} chunks={len(chunks)} total_indexed={final_count}"
-    )
-
+    logger.info(f"Confluence ingest done. chunks={len(chunks)} total={final_count}")
     return {
-        "message": "Confluence ingestion complete",
-        "space_key": request.space_key,
-        "pages_fetched": len(documents),
-        "chunks_added": len(chunks),
+        "message":                 "Confluence ingestion complete",
+        "space_key":               request.space_key,
+        "pages_fetched":           len(documents),
+        "chunks_added":            len(chunks),
         "total_documents_indexed": final_count,
-        "mock": request.mock,
+        "mock":                    request.mock,
+        "pages":                   page_results,   # ← full manifest
     }
 
 
@@ -661,93 +523,150 @@ async def ingest_confluence(request: ConfluenceIngestRequest):
 async def ingest_jira(request: JiraIngestRequest):
     """
     Ingest issues from a JIRA project into the knowledge base.
-    Each issue (summary + description + comments) becomes one or more chunks.
-
-    Pass mock=true in the request body to use built-in demo data
-    without a real JIRA instance.
-
-    Example (mock mode):
-        POST /ingest/jira
-        {
-            "base_url": "https://mock.atlassian.net",
-            "username": "demo@acme.com",
-            "api_token": "mock",
-            "project_key": "MOCK",
-            "mock": true
-        }
+    Use mock=true for a built-in demo without a real JIRA instance.
     """
     logger.info(
         f"JIRA ingest: project='{request.project_key}' "
         f"max_issues={request.max_issues} mock={request.mock}"
     )
-
-    vs = get_vectorstore(app.state)
+    vs         = get_vectorstore(app.state)
     embeddings = getattr(app.state, "embeddings", None)
     if embeddings is None:
         raise VectorStoreNotInitializedError("Embeddings not loaded")
 
-    # ── Fetch issues from JIRA ────────────────────────────────────────
     try:
-        if request.mock:
-            connector = JiraConnector.mock()
-        else:
-            connector = JiraConnector(
+        from connectors.jira import JiraConnector
+        connector = (
+            JiraConnector.mock() if request.mock
+            else JiraConnector(
                 base_url=request.base_url,
                 username=request.username,
                 api_token=request.api_token,
             )
-
+        )
         documents = connector.fetch_project(
             project_key=request.project_key,
             max_issues=request.max_issues,
         )
-
     except Exception as e:
         logger.error(f"JIRA fetch failed: {e}")
-        raise IngestionError(f"Failed to fetch from JIRA: {str(e)}", original_error=e)
+        raise IngestionError(f"Failed to fetch from JIRA: {e}", original_error=e)
 
     if not documents:
         return {
-            "message": "No issues found in the specified project",
-            "issues_fetched": 0,
-            "chunks_added": 0,
+            "message":                "No issues found in this project",
+            "issues_fetched":         0,
+            "chunks_added":           0,
             "total_documents_indexed": vs._collection.count(),
         }
 
-    # ── Chunk and index ───────────────────────────────────────────────
     try:
         from langchain_text_splitters import RecursiveCharacterTextSplitter
-
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            separators=["\n\n", "\n", ". ", " ", ""]
+            chunk_size=1000, chunk_overlap=200,
+            separators=["\n\n", "\n", ". ", " ", ""],
         )
         chunks = splitter.split_documents(documents)
-
-        logger.info(
-            f"JIRA: {len(documents)} issues → {len(chunks)} chunks "
-            f"(project={request.project_key})"
-        )
-
-        vs.add_documents(chunks)
+        logger.info(f"JIRA: {len(documents)} issues → {len(chunks)} chunks")
+        chunk_ids = _make_chunk_ids(chunks)
+        vs.add_documents(chunks, ids=chunk_ids)
         sync_chroma_to_gcs()
 
+        issue_manifest = {}
+        for chunk in chunks:
+            key = chunk.metadata.get("issue_key", chunk.metadata.get("source", "unknown"))
+            issue_manifest[key] = issue_manifest.get(key, 0) + 1
+        issue_results = [
+            {"issue_key": k, "chunks": c}
+            for k, c in sorted(issue_manifest.items())
+        ]
     except Exception as e:
-        logger.error(f"JIRA chunk/index failed: {e}")
+        logger.error(f"JIRA indexing failed: {e}")
         raise IngestionError("Failed to index JIRA documents", original_error=e)
 
     final_count = vs._collection.count()
-    logger.info(
-        f"JIRA ingest complete. "
-        f"issues={len(documents)} chunks={len(chunks)} total_indexed={final_count}"
-    )
-
+    logger.info(f"JIRA ingest done. chunks={len(chunks)} total={final_count}")
     return {
-        "message": "JIRA ingestion complete",
-        "project_key": request.project_key,
-        "issues_fetched": len(documents),
-        "chunks_added": len(chunks),
+        "message":                "JIRA ingestion complete",
+        "project_key":            request.project_key,
+        "issues_fetched":         len(documents),
+        "chunks_added":           len(chunks),
         "total_documents_indexed": final_count,
-        "mock": request.mock,
+        "mock":                   request.mock,
+        "issues":                 issue_results
     }
+
+
+@app.post("/admin/reindex")
+async def trigger_reindex():
+    """
+    Reload the ChromaDB index from GCS and refresh app.state.
+    Use this after uploading a fresh index to GCS externally
+    (e.g. after running ingest.py --upload locally).
+    Triggered by Cloud Scheduler or manually.
+    """
+    logger.info("Reindex triggered — reloading from GCS")
+    try:
+        from langchain_chroma import Chroma
+        from langchain_huggingface import HuggingFaceEmbeddings
+
+        # Re-download the latest index from GCS
+        sync_chroma_from_gcs()
+
+        # Reload the vectorstore into app.state
+        embeddings  = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+        vectorstore = Chroma(
+            persist_directory="./chroma_db",
+            embedding_function=embeddings,
+        )
+        app.state.vectorstore = vectorstore
+        app.state.embeddings  = embeddings
+
+        count = vectorstore._collection.count()
+        logger.info(f"Reindex complete. {count} chunks now live.")
+        return {"status": "success", "chunks_indexed": count}
+
+    except Exception as e:
+        logger.error(f"Reindex failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/index/contents")
+def index_contents():
+    """
+    List every unique document currently in the index with its chunk count.
+    Lets you verify exactly what has been ingested without querying.
+    """
+    vs = get_vectorstore(app.state)
+    try:
+        data     = vs._collection.get(include=["metadatas"])
+        metas    = data.get("metadatas", [])
+        total    = len(metas)
+
+        # Group by source document
+        sources: dict = {}
+        for meta in metas:
+            source    = meta.get("source", "unknown")
+            title     = meta.get("title") or meta.get("issue_key") or source
+            connector = meta.get("connector", "file")
+            key       = source
+            if key not in sources:
+                sources[key] = {
+                    "source":    source,
+                    "title":     title,
+                    "connector": connector,
+                    "chunks":    0,
+                }
+            sources[key]["chunks"] += 1
+
+        docs_list = sorted(sources.values(), key=lambda x: x["title"])
+
+        return {
+            "total_chunks":    total,
+            "unique_documents": len(docs_list),
+            "documents":        docs_list,
+        }
+    except Exception as e:
+        logger.error(f"index_contents failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
