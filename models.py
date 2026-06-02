@@ -1,19 +1,18 @@
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from datetime import datetime
+from typing import Optional
 
+class ChatMessage(BaseModel):
+    role:    str  # "user" or "assistant"
+    content: str
 
 class QueryRequest(BaseModel):
-    question: str = Field(
-        min_length=3,
-        max_length=500,
-        description="The question to ask the knowledge base",
-    )
-    top_k: int = Field(
-        default=4,
-        ge=1,
-        le=20,
-        description="Number of chunks to retrieve",
+    question: str = Field(min_length=3, max_length=500)
+    top_k:    int = Field(default=4, ge=1, le=20)
+    history:  list[ChatMessage] = Field(
+        default=[],
+        description="Previous turns in this chat session. Last N messages passed to LLM for context.",
     )
 
     @field_validator("question")
@@ -21,7 +20,6 @@ class QueryRequest(BaseModel):
         if not v.strip():
             raise ValueError("Question cannot be blank or only whitespace")
         return v.strip()
-
 
 class SourceDocument(BaseModel):
     content: str
