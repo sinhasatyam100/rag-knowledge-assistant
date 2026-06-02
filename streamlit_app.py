@@ -24,7 +24,7 @@ import json
 import time
 
 import os
-
+c
 # ── Config ────────────────────────────────────────────────────────────
 # Priority:
 # 1. Streamlit secrets (Streamlit Cloud production deployment)
@@ -89,12 +89,22 @@ def fetch_health(force: bool = False):
     return st.session_state.health
 
 
-def stream_answer(question: str, top_k: int = 5):
-    """Calls /ask/stream and yields parsed SSE event dicts."""
+def stream_answer(question: str, top_k: int = 5, history: list = None):
+    """POST to /ask/stream and yield parsed SSE event dicts."""
     url = f"{API_BASE}/ask/stream"
+    # Send the last 10 messages of history (5 turns) for context.
+    # Exclude the message we just added (the current question) — it's in 'question'.
+    history_payload = [
+        {"role": m["role"], "content": m["content"]}
+        for m in (history or [])[-10:]
+        if m["role"] in ("user", "assistant")
+    ]
     try:
-        with requests.post(url, json={"question": question, "top_k": top_k},
-                           stream=True, timeout=90) as resp:
+        with requests.post(url, json={
+            "question": question,
+            "top_k":    top_k,
+            "history":  history_payload,
+        }, stream=True, timeout=90) as resp:
             resp.raise_for_status()
             for raw in resp.iter_lines():
                 if not raw:
@@ -398,9 +408,22 @@ for msg in st.session_state.messages:
                             st.caption(preview[:200] + ("…" if len(preview) > 200 else ""))
 
 if question := st.chat_input("Ask a question about your documents…"):
-    st.session_state.messages.append({"role": "user", "content": question})
+    cid      = st.session_state.active_chat_id
+    chat_obj = st.session_state.chats[cid]
+
+        # Auto-name the chat from the first question
+    if chat_obj["name"] == "New chat" and not chat_obj["messages"]:
+        chat_obj["name"] = (question[:35] + "…") if len(question) > 35 else question
+
+    # Append user message
+    chat_obj["messages"].append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
+
+    # Build prior_messages AFTER appending current question,
+    # then slice off the last item (current question) so history
+    # only contains previous turns.
+    prior_messages = chat_obj["messages"][:-1]
 
     with st.chat_message("assistant"):
         placeholder = st.empty()
@@ -409,7 +432,9 @@ if question := st.chat_input("Ask a question about your documents…"):
         from_cache  = False
         error_msg   = None
 
-        for event in stream_answer(question, top_k=top_k):
+        # Pass all messages except the one we just appended (current question)
+        prior_messages = chat_obj["messages"][:-1]
+        for event in stream_answer(question, top_k=top_k, history=prior_messages):
             etype = event.get("type")
             if etype == "cache_hit":
                 from_cache = True

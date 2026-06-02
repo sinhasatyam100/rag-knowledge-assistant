@@ -29,9 +29,10 @@ from models import (
 from retriever import get_cross_encoder, retrieve_and_rerank
 from cache import cache_lookup, cache_store, cache_stats
 from tasks import celery_app, process_rag_query
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage, AIMessage
 
-
-# ── GCS helpers ───────────────────────────────────────────────────────
 
 def sync_chroma_from_gcs():
     """Download ChromaDB index from GCS at startup."""
@@ -284,24 +285,44 @@ async def ask_stream(request: QueryRequest):
             yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
             await asyncio.sleep(0.01)
 
-            from langchain_groq import ChatGroq
-            from langchain_core.prompts import ChatPromptTemplate
-
             llm = ChatGroq(
                 model="llama-3.1-8b-instant",
                 api_key=os.getenv("groq_api_key"),
                 streaming=True,
             )
-            prompt = ChatPromptTemplate.from_messages([
+
+            # Build message list manually so history slots naturally
+            # between the system prompt and the current question.
+            # Cap history at last 10 messages (5 turns) to stay within
+            # context window and avoid inflating latency.
+            MAX_HISTORY = 10
+            history_turns = request.history[-MAX_HISTORY:] if request.history else []
+
+            messages = [
                 ("system", (
                     "You are a helpful assistant.\n"
-                    "dive deep into the retrieved documents to answer the question.\n"
+                    "Use ONLY the following retrieved documents to answer the question.\n"
                     "If the answer is not in the documents, say you don't know.\n"
-                    "Always cite which Doc number(s) you used.\n\n"
+                    "Always cite which Doc number(s) you used.\n"
+                    "You also have access to the conversation history below — "
+                    "use it to understand follow-up questions and resolve pronouns "
+                    "like 'it', 'that', or 'the previous answer'.\n\n"
                     "Retrieved documents:\n{context}"
                 )),
-                ("human", "{question}"),
-            ])
+            ]
+
+            # Inject prior turns as real HumanMessage / AIMessage objects
+            # so the LLM sees them as actual conversation, not injected text.
+            for turn in history_turns:
+                if turn.role == "user":
+                    messages.append(HumanMessage(content=turn.content))
+                elif turn.role == "assistant":
+                    messages.append(AIMessage(content=turn.content))
+
+            # Current question goes last
+            messages.append(("human", "{question}"))
+
+            prompt = ChatPromptTemplate.from_messages(messages)
 
             full_response = ""
             async for chunk in (prompt | llm).astream(
