@@ -41,42 +41,23 @@ except (KeyError, FileNotFoundError):
 
 st.markdown("""
 <style>
-/* Source chips */
-.source-chip {
-    display: inline-block; background: #f0f2f6;
-    border: 1px solid #d0d3db; border-radius: 6px;
-    padding: 3px 10px; font-size: 12px; color: #444;
-    margin: 3px 3px 0 0; word-break: break-all;
+/* existing styles ... */
+.stChatInput {            
+    position: fixed;
+    bottom: 10px;
+    left: calc(var(--sidebar-width) + 20px);;
+    right: calc(var(--sidebar-width) + 20px);
 }
-/* Cache badge */
-.cache-badge {
-    display: inline-block; background: #fff3cd;
-    border: 1px solid #ffc107; border-radius: 6px;
-    padding: 2px 8px; font-size: 11px; color: #856404; margin-bottom: 4px;
-}
-/* Health metric cards */
-.metric-card {
-    background: #f8f9fa; border-radius: 8px;
-    padding: 10px 14px; margin-bottom: 6px; font-size: 13px;
-}
-.healthy   { color: #1a7a4a; font-weight: 600; }
-.unhealthy { color: #c0392b; font-weight: 600; }
-.warming   { color: #b7621a; font-weight: 600; }
 
-/* Chat history panel */
-.chat-item {
-    padding: 8px 12px; border-radius: 8px; margin-bottom: 4px;
-    cursor: pointer; border: 1px solid transparent;
-    font-size: 13px; word-break: break-word;
+/* Add bottom padding to chat area so messages don't hide behind input */
+section.main > div {
+    padding-bottom: 80px;
 }
-.chat-item-active {
-    background: #e8f0fe; border-color: #4285f4; font-weight: 600;
-}
-.chat-item-inactive {
-    background: #f8f9fa; border-color: #e0e0e0;
-}
-.chat-meta {
-    font-size: 10px; color: #888; margin-top: 2px;
+
+/* Right panel header alignment */
+[data-testid="column"]:last-child {
+    border-left: 1px solid #f0f0f0;
+    padding-left: 16px;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -459,7 +440,7 @@ with st.sidebar:
 
 # ── Main layout: chat area (left) + chat history panel (right) ────────
 # ── Main layout: chat area (left) + chat history panel (right) ────────
-chat_col, history_col = st.columns([3, 1], gap="medium")
+chat_col, history_col = st.columns([4, 1], gap="large")
 
 # ── Right column — chat history panel ────────────────────────────────
 with history_col:
@@ -555,23 +536,33 @@ with chat_col:
                                 st.caption(preview[:200] + ("…" if len(preview) > 200 else ""))
 
     # Chat input — stays at the bottom naturally since it's last in the column
-    if question := st.chat_input("Ask a question about your documents…"):
-        cid      = st.session_state.active_chat_id
-        chat_obj = st.session_state.chats[cid]
+    # ── Left column — active chat ─────────────────────────────────────────
+with chat_col:
+    st.markdown(f"### {active_name()}")
+    
+    # ... rename expander, divider, message history rendering ...
+    # STOP HERE — do not put chat_input inside this block
 
-        # Auto-name from first question
-        if chat_obj["name"] == "New chat" and not chat_obj["messages"]:
-            chat_obj["name"] = (question[:35] + "…") if len(question) > 35 else question
+# ── Chat input — OUTSIDE all columns so it pins to page bottom ────────
+if question := st.chat_input("Ask a question about your documents…"):
+    cid      = st.session_state.active_chat_id
+    chat_obj = st.session_state.chats[cid]
 
-        # Append user message
-        chat_obj["messages"].append({"role": "user", "content": question})
+    # Auto-name from first question
+    if chat_obj["name"] == "New chat" and not chat_obj["messages"]:
+        chat_obj["name"] = (question[:35] + "…") if len(question) > 35 else question
+
+    # Append user message
+    chat_obj["messages"].append({"role": "user", "content": question})
+    
+    # Re-render user message in chat_col
+    with chat_col:
         with st.chat_message("user"):
             st.markdown(question)
 
-        # Prior messages for conversation history (exclude current question)
-        prior_messages = chat_obj["messages"][:-1]
+    prior_messages = chat_obj["messages"][:-1]
 
-        # Stream assistant response
+    with chat_col:
         with st.chat_message("assistant"):
             placeholder = st.empty()
             full_answer = ""
@@ -614,10 +605,10 @@ with chat_col:
                         if preview:
                             st.caption(preview[:200] + ("…" if len(preview) > 200 else ""))
 
-        if full_answer and not error_msg:
-            chat_obj["messages"].append({
-                "role":       "assistant",
-                "content":    full_answer,
-                "sources":    sources,
-                "from_cache": from_cache,
-            })
+    if full_answer and not error_msg:
+        chat_obj["messages"].append({
+            "role":       "assistant",
+            "content":    full_answer,
+            "sources":    sources,
+            "from_cache": from_cache,
+        })
